@@ -1,0 +1,760 @@
+-- ============================================================================
+--  Unknown Hub Loader
+-- ----------------------------------------------------------------------------
+-- Local bootstrap that:
+--   1. Shows a splash screen
+--   2. Validates required executor functions
+--   3. Opens a session with the Chronix gate server
+--   4. Downloads an encrypted "shell" module (or legacy file build)
+--   5. Decrypts / executes it
+--
+-- Cryptography used:
+--   - SHA-256 (pure Lua, using bit32)
+--   - Base64 (encode / decode)
+--   - Simple XOR keystream derived from SHA-256(seed .. counter)
+-- ============================================================================
+
+-- ============================================================================
+-- SECTION 1: Crypto module (SHA-256, Base64, XOR keystream)
+-- ============================================================================
+
+local Crypto = (function()
+	local M = {}
+
+	-- SHA-256 round constants
+	local K = {
+		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+		0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+		0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+		0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+		0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+		0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+		0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+		0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+		0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+		0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+		0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+		0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+		0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+		0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+		0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+		0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+	}
+
+	local B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local B64_DECODE = {}
+	for i = 1, #B64_ALPHA do
+		B64_DECODE[string.sub(B64_ALPHA, i, i)] = i - 1
+	end
+
+	-- 32-bit rotate right
+	local function rrotate(n, b)
+		return bit32.bor(bit32.rshift(n, b), bit32.lshift(n, 32 - b))
+	end
+
+	-- Unsigned 32-bit addition of any number of arguments
+	local function uadd(...)
+		local result = 0
+		for i = 1, select("#", ...) do
+			result = (result + select(i, ...)) % 4294967296
+		end
+		return result
+	end
+
+	-- Hex-encoded SHA-256
+	function M.sha256(msg)
+		local raw = M.sha256raw(msg)
+		local out = {}
+		for i = 1, 32 do
+			out[i] = string.format("%02x", string.byte(raw, i))
+		end
+		return table.concat(out)
+	end
+
+	-- Raw 32-byte SHA-256 digest
+	function M.sha256raw(msg)
+		local H0, H1, H2, H3 = 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a
+		local H4, H5, H6, H7 = 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+
+		local msg_bits = #msg * 8
+
+		-- Padding: append 0x80, then zeros until length ≡ 56 (mod 64)
+		local padded = msg .. string.char(0x80)
+		while (#padded % 64) ~= 56 do
+			padded = padded .. string.char(0)
+		end
+
+		-- Append 64-bit big-endian message length
+		for i = 8, 1, -1 do
+			local shift = (i - 1) * 8
+			padded = padded .. string.char(bit32.band(bit32.rshift(msg_bits, shift), 0xff))
+		end
+
+		-- Process each 512-bit chunk
+		for chunk_start = 1, #padded, 64 do
+			local chunk = string.sub(padded, chunk_start, chunk_start + 63)
+
+			-- Message schedule
+			local W = {}
+			for i = 1, 16 do
+				local idx = (i - 1) * 4 + 1
+				W[i] = bit32.bor(
+					bit32.lshift(string.byte(chunk, idx), 24),
+					bit32.lshift(string.byte(chunk, idx + 1), 16),
+					bit32.lshift(string.byte(chunk, idx + 2), 8),
+					string.byte(chunk, idx + 3)
+				)
+			end
+			for i = 17, 64 do
+				local w15 = W[i - 15]
+				local w2 = W[i - 2]
+				local s0 = bit32.bxor(rrotate(w15, 7), rrotate(w15, 18), bit32.rshift(w15, 3))
+				local s1 = bit32.bxor(rrotate(w2, 17), rrotate(w2, 19), bit32.rshift(w2, 10))
+				W[i] = uadd(W[i - 16], s0, W[i - 7], s1)
+			end
+
+			local a, b, c, d = H0, H1, H2, H3
+			local e, f, g, h = H4, H5, H6, H7
+
+			for i = 1, 64 do
+				local S1 = bit32.bxor(rrotate(e, 6), rrotate(e, 11), rrotate(e, 25))
+				local ch = bit32.bxor(bit32.band(e, f), bit32.band(bit32.bnot(e), g))
+				local temp1 = uadd(h, S1, ch, K[i], W[i])
+				local S0 = bit32.bxor(rrotate(a, 2), rrotate(a, 13), rrotate(a, 22))
+				local maj = bit32.bxor(bit32.band(a, b), bit32.band(a, c), bit32.band(b, c))
+				local temp2 = uadd(S0, maj)
+
+				h = g
+				g = f
+				f = e
+				e = uadd(d, temp1)
+				d = c
+				c = b
+				b = a
+				a = uadd(temp1, temp2)
+			end
+
+			H0 = uadd(H0, a)
+			H1 = uadd(H1, b)
+			H2 = uadd(H2, c)
+			H3 = uadd(H3, d)
+			H4 = uadd(H4, e)
+			H5 = uadd(H5, f)
+			H6 = uadd(H6, g)
+			H7 = uadd(H7, h)
+		end
+
+		local function make_be32(n)
+			return string.char(
+				bit32.band(bit32.rshift(n, 24), 0xff),
+				bit32.band(bit32.rshift(n, 16), 0xff),
+				bit32.band(bit32.rshift(n, 8), 0xff),
+				bit32.band(n, 0xff)
+			)
+		end
+
+		return make_be32(H0) .. make_be32(H1) .. make_be32(H2) .. make_be32(H3)
+			.. make_be32(H4) .. make_be32(H5) .. make_be32(H6) .. make_be32(H7)
+	end
+
+	-- Base64 decode (yields every 20000 chars to avoid freezing)
+	function M.b64decode(s)
+		s = string.gsub(s, "[ \n\r\t]", "")
+
+		local result = {}
+		local acc, bits = 0, 0
+
+		for i = 1, #s do
+			if i % 20000 == 0 then
+				task.wait()
+			end
+			local c = string.sub(s, i, i)
+			if c == "=" then
+				break
+			end
+
+			local val = B64_DECODE[c]
+			if val then
+				acc = bit32.lshift(acc, 6) + val
+				bits = bits + 6
+				if bits >= 8 then
+					bits = bits - 8
+					table.insert(result, string.char(bit32.band(bit32.rshift(acc, bits), 0xff)))
+				end
+			end
+		end
+
+		return table.concat(result)
+	end
+
+	-- Base64 encode
+	function M.b64encode(s)
+		local result = {}
+		for i = 1, #s, 3 do
+			local b1 = string.byte(s, i)
+			local b2 = string.byte(s, i + 1)
+			local b3 = string.byte(s, i + 2)
+			local have2 = (i + 1) <= #s
+			local have3 = (i + 2) <= #s
+
+			local n = bit32.lshift(b1, 16)
+			if b2 then
+				n = n + bit32.lshift(b2, 8)
+			end
+			if b3 then
+				n = n + b3
+			end
+
+			local c1 = bit32.band(bit32.rshift(n, 18), 0x3f) + 1
+			local c2 = bit32.band(bit32.rshift(n, 12), 0x3f) + 1
+			local c3 = have2 and (bit32.band(bit32.rshift(n, 6), 0x3f) + 1) or nil
+			local c4 = have3 and (bit32.band(n, 0x3f) + 1) or nil
+
+			table.insert(result, string.sub(B64_ALPHA, c1, c1))
+			table.insert(result, string.sub(B64_ALPHA, c2, c2))
+			table.insert(result, c3 and string.sub(B64_ALPHA, c3, c3) or "=")
+			table.insert(result, c4 and string.sub(B64_ALPHA, c4, c4) or "=")
+		end
+		return table.concat(result)
+	end
+
+	-- Produce `n` bytes of keystream by hashing seed .. counter
+	function M.keystream(seed, n)
+		local parts = {}
+		local total = 0
+		local i = 0
+		while total < n do
+			local block = M.sha256raw(seed .. tostring(i))
+			table.insert(parts, block)
+			total = total + #block
+			i = i + 1
+			if i % 96 == 0 then
+				task.wait()
+			end
+		end
+		return string.sub(table.concat(parts), 1, n)
+	end
+
+	-- XOR `data` with the keystream derived from `seed`
+	function M.xor(data, seed)
+		local ks = M.keystream(seed, #data)
+		local result = {}
+		local steps = 0
+		for i = 1, #data, 64 do
+			steps = steps + 1
+			if steps % 512 == 0 then
+				task.wait()
+			end
+
+			local end_idx = math.min(i + 63, #data)
+			local chunk = {}
+			for j = 1, end_idx - i + 1 do
+				local d = string.byte(data, i + j - 1)
+				local k = string.byte(ks, i + j - 1)
+				chunk[j] = string.char(bit32.bxor(d, k))
+			end
+			table.insert(result, table.concat(chunk))
+		end
+		return table.concat(result)
+	end
+
+	return M
+end)()
+
+-- ============================================================================
+-- SECTION 2: Configuration
+-- ============================================================================
+
+local GATE   = "https://chronix-gate.net"  -- Gate server base URL
+local KEY    = ""                          -- Optional license key (empty = public)
+local SLUG   = ""                          -- Game slug (auto-detected if empty)
+local PUBLIC = ""                          -- Fallback public build URL (empty = none)
+local L      = nil                         -- Splash screen handle
+
+-- ============================================================================
+-- SECTION 3: Utility helpers
+-- ============================================================================
+
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local function notify(msg)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", {
+			Title = "Chronix",
+			Text = msg,
+			Duration = 8,
+		})
+	end)
+end
+
+local function fail(msg)
+	local executor = "unknown"
+	pcall(function()
+		if type(identifyexecutor) == "function" then
+			executor = tostring(identifyexecutor())
+		end
+	end)
+	warn("[chronix] " .. tostring(msg) .. " | executor: " .. executor)
+	notify(tostring(msg))
+	if L then
+		L:fail(tostring(msg))
+	end
+	return nil
+end
+
+-- ============================================================================
+-- SECTION 4: Executor capability check
+-- ============================================================================
+
+local missing = {}
+if type(loadstring) ~= "function" then
+	missing[#missing + 1] = "loadstring"
+end
+if type(getgenv) ~= "function" then
+	missing[#missing + 1] = "getgenv"
+end
+if not pcall(function()
+	return game.HttpGet
+end) then
+	missing[#missing + 1] = "HttpGet"
+end
+if #missing > 0 then
+	return fail("your executor is missing: " .. table.concat(missing, ", "))
+end
+
+-- ============================================================================
+-- SECTION 5: Splash screen
+-- ============================================================================
+
+local function makeSplash(name)
+	-- Kill any previous splash instance
+	pcall(function()
+		local old = getgenv().__ChronixSplash
+		if type(old) == "table" and type(old.kill) == "function" then
+			old:kill()
+		end
+		getgenv().__ChronixSplash = nil
+	end)
+
+	-- Clean up any orphaned splash GUIs
+	pcall(function()
+		local roots = {}
+		if type(gethui) == "function" then
+			local h = gethui()
+			if h then
+				roots[#roots + 1] = h
+			end
+		end
+		local okc, cg = pcall(function()
+			return game:GetService("CoreGui")
+		end)
+		if okc and cg then
+			roots[#roots + 1] = cg
+		end
+		local lp = game:GetService("Players").LocalPlayer
+		local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
+		if pg then
+			roots[#roots + 1] = pg
+		end
+
+		for _, r in ipairs(roots) do
+			for _, g in ipairs(r:GetChildren()) do
+				if g:IsA("ScreenGui") and g.Name == "ChronixSplash" then
+					pcall(function()
+						g:Destroy()
+					end)
+				end
+			end
+		end
+	end)
+
+	-- Splash state
+	local S = {
+		target  = 0,   -- target progress [0..1]
+		shown   = 0,   -- displayed progress (lerped)
+		ceil    = 0,   -- upper bound / clamp
+		rate    = 0.35,
+		dead    = false,
+		t0      = os.clock(),
+		minTime = 0.6,
+	}
+
+	local accent = Color3.fromRGB(120, 110, 255)
+
+	-- Determine mobile/small layout
+	local small = false
+	pcall(function()
+		local cam = workspace.CurrentCamera
+		small = UserInputService.TouchEnabled
+			or (cam ~= nil and cam.ViewportSize.X < 700)
+	end)
+
+	local cardW = small and 250 or 320
+	local cardH = small and 104 or 124
+
+	-- Root GUI
+	local sg = Instance.new("ScreenGui")
+	sg.Name = "ChronixSplash"
+	sg.ResetOnSpawn = false
+	sg.IgnoreGuiInset = true
+	sg.DisplayOrder = 1000
+	sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	-- Dim background
+	local dim = Instance.new("Frame")
+	dim.Size = UDim2.fromScale(1, 1)
+	dim.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	dim.BackgroundTransparency = 1
+	dim.BorderSizePixel = 0
+	dim.Parent = sg
+
+	-- Card
+	local card = Instance.new("Frame")
+	card.AnchorPoint = Vector2.new(0.5, 0.5)
+	card.Position = UDim2.fromScale(0.5, 0.5)
+	card.Size = UDim2.fromOffset(cardW, cardH)
+	card.BackgroundColor3 = Color3.fromRGB(14, 14, 19)
+	card.BackgroundTransparency = 0.05
+	card.BorderSizePixel = 0
+	card.Parent = dim
+
+	local cardCorner = Instance.new("UICorner")
+	cardCorner.CornerRadius = UDim.new(0, 10)
+	cardCorner.Parent = card
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = accent
+	stroke.Thickness = 1
+	stroke.Transparency = 0.3
+	stroke.Parent = card
+
+	-- Helper for creating children of the card
+	local function mk(class, props)
+		local o = Instance.new(class)
+		for k, v in pairs(props) do
+			o[k] = v
+		end
+		o.Parent = card
+		return o
+	end
+
+	mk("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 16, 0, small and 12 or 16),
+		Size = UDim2.new(1, -32, 0, 14),
+		Font = Enum.Font.GothamBold,
+		Text = "CHRONIX HUB",
+		TextColor3 = accent,
+		TextSize = small and 11 or 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+
+	local title = mk("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 16, 0, small and 28 or 34),
+		Size = UDim2.new(1, -32, 0, 22),
+		Font = Enum.Font.GothamBold,
+		Text = tostring(name or "loading"),
+		TextColor3 = Color3.fromRGB(240, 242, 252),
+		TextSize = small and 15 or 17,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
+	local step = mk("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 16, 1, small and -36 or -42),
+		Size = UDim2.new(1, -70, 0, 14),
+		Font = Enum.Font.Gotham,
+		Text = "connecting",
+		TextColor3 = Color3.fromRGB(150, 152, 168),
+		TextSize = small and 10 or 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+
+	local pct = mk("TextLabel", {
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -16, 1, small and -36 or -42),
+		Size = UDim2.new(0, 40, 0, 14),
+		Font = Enum.Font.GothamBold,
+		Text = "0%",
+		TextColor3 = Color3.fromRGB(150, 152, 168),
+		TextSize = small and 10 or 11,
+		TextXAlignment = Enum.TextXAlignment.Right,
+	})
+
+	-- Progress bar
+	local track = mk("Frame", {
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 16, 1, small and -14 or -18),
+		Size = UDim2.new(1, -32, 0, 5),
+		BackgroundColor3 = Color3.fromRGB(38, 38, 48),
+		BackgroundTransparency = 0.25,
+		BorderSizePixel = 0,
+	})
+	local trackCorner = Instance.new("UICorner")
+	trackCorner.CornerRadius = UDim.new(1, 0)
+	trackCorner.Parent = track
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.BackgroundColor3 = accent
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(1, 0)
+	fillCorner.Parent = fill
+
+	-- Parent the GUI to the best available container
+	if type(gethui) == "function" then
+		pcall(function()
+			sg.Parent = gethui()
+		end)
+	end
+	if not sg.Parent and syn and type(syn.protect_gui) == "function" then
+		pcall(function()
+			syn.protect_gui(sg)
+			sg.Parent = game:GetService("CoreGui")
+		end)
+	end
+	if not sg.Parent then
+		pcall(function()
+			sg.Parent = game:GetService("CoreGui")
+		end)
+	end
+	if not sg.Parent then
+		pcall(function()
+			local p = game:GetService("Players").LocalPlayer
+			sg.Parent = p and p:FindFirstChildOfClass("PlayerGui")
+		end)
+	end
+	S.Gui = sg
+
+	-- Progress animation loop
+	task.spawn(function()
+		while not S.dead do
+			local dt = RunService.Heartbeat:Wait()
+			if S.ceil > S.target then
+				local k = 1 - math.exp(-(S.rate or 0.35) * dt)
+				S.target = S.target + (S.ceil - S.target) * k
+			end
+			S.shown = S.shown + (S.target - S.shown) * math.min(1, 9 * dt)
+			if math.abs(S.target - S.shown) < 0.0015 then
+				S.shown = S.target
+			end
+			fill.Size = UDim2.new(math.clamp(S.shown, 0, 1), 0, 1, 0)
+			pct.Text = tostring(math.floor(S.shown * 100 + 0.5)) .. "%"
+		end
+	end)
+
+	-- Public methods
+	function S:say(t)
+		pcall(function()
+			step.Text = tostring(t)
+		end)
+	end
+
+	function S:name(t)
+		pcall(function()
+			title.Text = tostring(t)
+		end)
+	end
+
+	function S:pct(v)
+		S.target = math.clamp(tonumber(v) or 0, 0, 1)
+		if S.ceil < S.target then
+			S.ceil = S.target
+		end
+	end
+
+	function S:to(c, secs)
+		S.ceil = math.clamp(tonumber(c) or 0, 0, 1)
+		S.rate = 1 / math.max(tonumber(secs) or 3, 0.2)
+	end
+
+	function S:kill()
+		if S.dead then
+			return
+		end
+		S.dead = true
+		S.shown = 1
+		pcall(function()
+			if getgenv().__ChronixSplash == S then
+				getgenv().__ChronixSplash = nil
+			end
+		end)
+		pcall(function()
+			sg:Destroy()
+		end)
+	end
+
+	function S:fail(t)
+		if S.dead then
+			return
+		end
+		S:say(t or "failed")
+		pcall(function()
+			fill.BackgroundColor3 = Color3.fromRGB(230, 80, 80)
+			stroke.Color = Color3.fromRGB(230, 80, 80)
+		end)
+		task.delay(6, function()
+			S:kill()
+		end)
+	end
+
+	function S:done()
+		if S.dead then
+			return
+		end
+		S.ceil = 1
+		S.rate = 6
+		S:pct(1)
+		S:say("ready")
+
+		local left = S.minTime - (os.clock() - S.t0)
+		if left > 0 then
+			task.wait(left)
+		end
+
+		local spin = os.clock()
+		while S.shown < 0.999 and os.clock() - spin < 1.5 do
+			RunService.Heartbeat:Wait()
+		end
+		task.wait(0.15)
+
+		-- Fade out
+		for i = 1, 16 do
+			local a = 1 - i / 16
+			card.BackgroundTransparency = 0.05 + 0.95 * (1 - a)
+			stroke.Transparency = 0.3 + 0.7 * (1 - a)
+			for _, c in ipairs(card:GetChildren()) do
+				if c:IsA("TextLabel") then
+					c.TextTransparency = 1 - a
+				end
+				if c:IsA("Frame") then
+					c.BackgroundTransparency = 1 - a
+				end
+			end
+			RunService.Heartbeat:Wait()
+		end
+		S:kill()
+	end
+
+	return S
+end
+
+pcall(function()
+	L = makeSplash("loading")
+end)
+pcall(function()
+	getgenv().__ChronixSplash = L
+end)
+if L then
+	L:say("checking your executor")
+	L:pct(0.02)
+	L:to(0.13, 2.5)
+end
+
+-- ============================================================================
+-- SECTION 6: HTTP / encoding helpers
+-- ============================================================================
+
+-- URL-encode a string
+local function enc(s)
+	return (tostring(s):gsub("[^%w%-%.%_%~]", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+end
+
+-- Cache buster
+local bustN = 0
+local function bust()
+	bustN = bustN + 1
+	return tostring(math.random(1, 999999999)) .. "x" .. tostring(bustN)
+end
+
+-- game:HttpGet with a fallback (some executors require the 2nd arg)
+local function get(url)
+	local ok, res = pcall(function()
+		return game:HttpGet(url, true)
+	end)
+	if not ok or type(res) ~= "string" then
+		ok, res = pcall(function()
+			return game:HttpGet(url)
+		end)
+	end
+	if ok and type(res) == "string" then
+		return res
+	end
+	return nil, tostring(res)
+end
+
+-- Compile and run a chunk
+local function run(source, label)
+	local fn, compileErr = loadstring(source)
+	if not fn then
+		return fail(label .. " failed to compile: " .. tostring(compileErr))
+	end
+	local ranOk, runErr = pcall(fn)
+	if not ranOk then
+		return fail(label .. " errored: " .. tostring(runErr))
+	end
+	return true
+end
+
+-- ============================================================================
+-- SECTION 7: Public build fallback
+-- ============================================================================
+
+local function loadPublic(why)
+	if why then
+		notify(why .. " - loading the public build")
+		if L then
+			L:say(tostring(why) .. " - public build")
+		end
+	end
+	if L then
+		L:pct(0.55)
+	end
+	if PUBLIC == "" then
+		return fail(why or "no public build is configured")
+	end
+	local src, getErr = get(PUBLIC .. (PUBLIC:find("?", 1, true) and "&" or "?") .. "z=" .. bust())
+	if not src or #src == 0 then
+		return fail("cannot reach the public build: " .. tostring(getErr))
+	end
+	return run(src, "public build")
+end
+
+-- ============================================================================
+-- SECTION 8: Identify the player / place / game
+-- ============================================================================
+
+local Players = game:GetService("Players")
+local plr = Players.LocalPlayer
+if not plr then
+	if L then
+		L:say("waiting for your account")
+		L:to(0.24, 5)
+	end
+	local t0 = os.clock()
+	repeat
+		task.wait(0.1)
+		plr = Players.LocalPlayer
+	until plr or os.clock() - t0 > 10
+end
+if not plr then
+	return loadPublic("could not read your roblox account")
+end
+
+local UID = tostring(plr.UserId)
+if UID == "" or UID == "0" then
+	return loadPublic("could not read your roblox account")
+end
+
+local PLACE = ""
+pcall(function()
+	PLACE = t
